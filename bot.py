@@ -38,36 +38,50 @@ load_dotenv(override=True)
 
 
 DEFAULT_SYSTEM_PROMPT = """
-Du bist der deutschsprachige Voice-Agent unserer Agentur. Du hilfst aktiv bei Terminbuchungen
-und nutzt dafür die bereitgestellten Tools. Prüfe Verfügbarkeiten mit `get_bookings` und lege
-Termine mit `create_booking` an. Arbeite ausschließlich mit Zeiten zur vollen Stunde (Format
-HH:MM) und in der Zeitzone Europe/Berlin. Halte dich an die Öffnungszeiten: Montag–Freitag
-Startzeiten 07:00–14:00, Samstag 07:00–12:00, Sonntag geschlossen. Erfrage Name,
-E-Mail-Adresse und die gewünschte Kontaktart (phone/zoom/teams). Die Telefonnummer des
-Anrufers liegt dir aus dem System bereits vor – frage nicht erneut danach. Bestätige Details,
-prüfe Slots und mache Alternativvorschläge, falls gewünschte Termine nicht verfügbar sind.
+Du bist der deutschsprachige Voice-Agent unserer Agentur. Dein Ziel ist es, für den Anrufer
+einen telefonischen Beratungstermin zu buchen.
+
+Workflow:
+1. Begrüße freundlich und erkläre kurz, dass du bei Terminbuchungen hilfst.
+2. Frage gezielt nach dem Namen und nach gewünschtem Datum/Uhrzeit (volle Stunde,
+   Format HH:MM) – weitere Kontaktdaten brauchst du nicht.
+3. Prüfe Verfügbarkeiten mit `get_bookings`. Halte dich an die Öffnungszeiten: Montag–Freitag
+   Startzeiten 07:00–14:00, Samstag 07:00–12:00, Sonntag geschlossen.
+4. Fasse den Termin (Name, Datum, Uhrzeit) kurz zusammen und lasse ihn bestätigen.
+5. Lege den Termin mit `create_booking` an. Verwende dabei automatisch die erkannte
+   Telefonnummer des Anrufers. Meeting-Typ ist immer `phone`; frage nicht erneut nach einer
+   Telefonnummer oder E-Mail-Adresse.
+6. Bestätige den erfolgreichen Termin knapp (Datum/Uhrzeit nennen) und erwähne, dass eine
+   Bestätigungs-SMS verschickt wird. Biete Alternativtermine an, falls der Slot belegt ist.
+
+Sprich präzise und überzeugend auf Deutsch.
 """.strip()
 
 DEFAULT_BOOKING_BASE_URL = "https://agentur.fly.dev"
 DEFAULT_NOTIFICATION_RECIPIENT = "+4915752651227"
 BOOKING_TIMEZONE = "Europe/Berlin"
-ALLOWED_MEETING_TYPES = {"phone", "zoom", "teams"}
+DEFAULT_FALLBACK_EMAIL = "voice-agent@vocaris-solutions.de"
+ALLOWED_MEETING_TYPES = {"phone"}
 INITIAL_GREETING_INSTRUCTION = (
     "Begrüße den Anrufer freundlich, erkläre kurz, dass du bei "
-    "Terminbuchungen helfen kannst, und frage nach dem Anliegen."
+    "Terminbuchungen hilfst, und frage direkt nach seinem Namen sowie dem "
+    "gewünschten Datum/Uhrzeit (volle Stunde)."
 )
 CALLER_PHONE_INSTRUCTION_TEMPLATE = (
     "Der aktuelle Anrufer wurde über Twilio identifiziert. Verwende für "
     "Telefontermine automatisch die Nummer {phone} und frage nicht erneut danach."
+)
+BOOKING_FLOW_REMINDER = (
+    "Frage ausschließlich nach Name und gewünschtem Datum/Uhrzeit. "
+    "Der Termin ist immer telefonisch (meetingType=phone) und die Telefonnummer "
+    "kommt aus dem System. Nach erfolgreicher Buchung kurz bestätigen und die "
+    "SMS-Erwähnung nicht vergessen."
 )
 MEETING_TYPE_ALIASES = {
     "telefon": "phone",
     "telefonat": "phone",
     "anruf": "phone",
     "call": "phone",
-    "microsoft teams": "teams",
-    "teams-call": "teams",
-    "microsoft-teams": "teams",
 }
 
 
@@ -106,24 +120,19 @@ def build_booking_tools_schema() -> ToolsSchema:
             FunctionSchema(
                 name="create_booking",
                 description=(
-                    "Legt eine neue Buchung an. Nutze dies erst, wenn alle"
-                    " relevanten Daten bestätigt wurden."
+                    "Legt eine neue telefonische Buchung an. Nutze dies erst,"
+                    " nachdem Name sowie Datum/Zeit bestätigt wurden."
                 ),
                 properties={
                     "name": {
                         "type": "string",
                         "description": "Vollständiger Name des Kunden.",
                     },
-                    "email": {
-                        "type": "string",
-                        "description": "Gültige E-Mail-Adresse des Kunden.",
-                        "format": "email",
-                    },
                     "meetingType": {
                         "type": "string",
                         "description": (
-                            "Kontaktart: phone für Telefon, zoom oder teams"
-                            " für Online-Meetings."
+                            "Optional. Wird automatisch auf 'phone' gesetzt,"
+                            " falls nichts angegeben ist."
                         ),
                         "enum": sorted(ALLOWED_MEETING_TYPES),
                     },
@@ -133,6 +142,14 @@ def build_booking_tools_schema() -> ToolsSchema:
                             "Pflicht bei meetingType=phone. Internationale"
                             " Schreibweise bevorzugt."
                         ),
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Falls leer, verwendet der Agent eine"
+                            " Standardadresse."
+                        ),
+                        "format": "email",
                     },
                     "date": {
                         "type": "string",
@@ -150,7 +167,7 @@ def build_booking_tools_schema() -> ToolsSchema:
                         "pattern": r"^\\d{2}:\\d{2}$",
                     },
                 },
-                required=["name", "email", "meetingType", "date", "time"],
+                required=["name", "date", "time"],
             ),
         ]
     )
@@ -216,6 +233,18 @@ class BookingAPI:
         self.twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         self.twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN")
 
+        fallback_email_env = os.getenv("BOOKING_FALLBACK_EMAIL")
+        sanitized_fallback = self._sanitize_email(fallback_email_env)
+        if sanitized_fallback:
+            self.fallback_email = sanitized_fallback
+        else:
+            if fallback_email_env:
+                logger.warning(
+                    "BOOKING_FALLBACK_EMAIL ungültig, verwende {} als Standard.",
+                    DEFAULT_FALLBACK_EMAIL,
+                )
+            self.fallback_email = DEFAULT_FALLBACK_EMAIL
+
     def _build_headers(self) -> Dict[str, str]:
         headers: Dict[str, str] = {"Accept": "application/json"}
         if self.agent_secret:
@@ -269,6 +298,20 @@ class BookingAPI:
         if digits.startswith("+") and len(digits) >= 8:
             return digits
         return None
+
+    @staticmethod
+    def _sanitize_email(candidate: Optional[str]) -> Optional[str]:
+        if not candidate:
+            return None
+        value = str(candidate).strip()
+        if not value or "@" not in value:
+            return None
+        local_part, _, domain = value.rpartition("@")
+        if not local_part or not domain:
+            return None
+        if domain.startswith(".") or domain.endswith(".") or "." not in domain:
+            return None
+        return value
 
     @staticmethod
     def _detect_region(phone: Optional[str]) -> Optional[str]:
@@ -518,8 +561,12 @@ class BookingAPI:
             "Neue Terminbuchung:",
             f"Datum/Zeit: {booking_payload['date']} {booking_payload['time']} ({self.timezone})",
             f"Meeting-Typ: {booking_payload['meetingType']}",
-            f"Kunde: {booking_payload['name']} ({booking_payload['email']})",
         ]
+        customer_line = f"Kunde: {booking_payload['name']}"
+        email_value = booking_payload.get("email")
+        if email_value:
+            customer_line += f" ({email_value})"
+        lines.append(customer_line)
         phone = booking_payload.get("phone") or self.caller_phone
         if phone:
             lines.append(f"Telefon: {phone}")
@@ -650,35 +697,34 @@ class BookingAPI:
     async def handle_create_booking(self, params: FunctionCallParams) -> None:
         args = dict(params.arguments or {})
         name = str(args.get("name") or "").strip()
-        email = str(args.get("email") or "").strip()
+        email_raw = str(args.get("email") or "").strip()
         meeting_type_raw = str(args.get("meetingType") or "").strip()
-        meeting_type = self._normalize_meeting_type(meeting_type_raw)
         provided_phone = str(args.get("phone") or "").strip()
         date_raw = str(args.get("date") or "").strip()
         time_raw = str(args.get("time") or "").strip()
 
+        meeting_type = "phone"
+        if meeting_type_raw:
+            normalized_type = self._normalize_meeting_type(meeting_type_raw)
+            if normalized_type and normalized_type != "phone":
+                logger.info(
+                    "Meeting-Typ {} wird ignoriert und auf 'phone' gesetzt.",
+                    meeting_type_raw,
+                )
+
+        resolved_phone = self._resolve_phone_for_payload(meeting_type, provided_phone)
+
         errors: List[str] = []
         if not name:
             errors.append("name: Bitte den vollständigen Namen erfassen.")
-        if not email or "@" not in email:
-            errors.append("email: Bitte eine gültige E-Mail-Adresse angeben.")
-        if not meeting_type:
-            errors.append(
-                "meetingType: Bitte phone, zoom oder teams als Kontaktart wählen."
-            )
-        elif meeting_type not in ALLOWED_MEETING_TYPES:
-            errors.append(
-                "meetingType: Ungültig. Erlaubt sind 'phone', 'zoom' oder 'teams'."
-            )
-        resolved_phone = self._resolve_phone_for_payload(meeting_type, provided_phone)
-        if meeting_type == "phone" and not resolved_phone:
-            errors.append(
-                "phone: Für Telefontermine wird die erkannte Anrufernummer benötigt."
-            )
         if not date_raw:
             errors.append("date: Bitte ein Datum im Format YYYY-MM-DD angeben.")
         if not time_raw:
             errors.append("time: Bitte eine Startzeit im Format HH:MM angeben.")
+        if not resolved_phone:
+            errors.append(
+                "phone: Die erkannte Anrufernummer steht nicht zur Verfügung."
+            )
 
         slot_date = None
         slot_time = None
@@ -704,9 +750,17 @@ class BookingAPI:
             return
 
         assert slot_date is not None and slot_time is not None
+        sanitized_email = self._sanitize_email(email_raw)
+        if email_raw and not sanitized_email:
+            logger.warning(
+                "E-Mail '{}' verworfen, verwende Fallback {}.",
+                email_raw,
+                self.fallback_email,
+            )
+        email_value = sanitized_email or self.fallback_email
         booking_payload: Dict[str, Any] = {
             "name": name,
-            "email": email,
+            "email": email_value,
             "meetingType": meeting_type,
             "date": slot_date.isoformat(),
             "time": slot_time,
@@ -849,7 +903,8 @@ async def run_bot(
     )
 
     initial_messages = [
-        {"role": "user", "content": INITIAL_GREETING_INSTRUCTION}
+        {"role": "user", "content": INITIAL_GREETING_INSTRUCTION},
+        {"role": "user", "content": BOOKING_FLOW_REMINDER},
     ]
     prompt_phone = booking_client.caller_phone or caller_phone
     if prompt_phone:
