@@ -1,10 +1,12 @@
 fastapi
 uvicorn[standard]
 python-dotenv
+httpx
 websockets
 loguru
 pipecat-ai[websocket,google,silero,runner]>=0.0.84
 pipecatcloud>=0.2.4
 wsproto>=1.2.0
+phonenumberslite
 
 
