@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 python-dotenv
+httpx
 websockets
 loguru
 pipecat-ai[websocket,google,silero,runner]>=0.0.84
