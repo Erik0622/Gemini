@@ -793,29 +793,53 @@ class BookingAPI:
             return
 
         if response.status_code == 200:
+            raw_text = response.text
+            response_mapping: Mapping[str, Any] = {}
             try:
                 response_data = response.json()
             except ValueError:
-                response_data = {"success": True}
-
-            if not isinstance(response_data, Mapping):
-                response_mapping: Mapping[str, Any] = {}
-            else:
+                response_data = None
+            if isinstance(response_data, Mapping):
                 response_mapping = response_data
+
+            success_flag = bool(response_mapping.get("success"))
+            if success_flag:
+                await params.result_callback(
+                    {
+                        "success": True,
+                        "bookingId": response_mapping.get("id"),
+                        "message": response_mapping.get("message")
+                        or "Termin wurde erfolgreich gebucht.",
+                        "request": booking_payload,
+                        "response": response_mapping,
+                        "timezone": self.timezone,
+                    }
+                )
+                asyncio.create_task(
+                    self._send_sms_notification(
+                        dict(booking_payload), response_mapping
+                    )
+                )
+                return
+
+            error_message = None
+            if isinstance(response_mapping, Mapping):
+                raw_error = response_mapping.get("error") or response_mapping.get("message")
+                if isinstance(raw_error, str) and raw_error.strip():
+                    error_message = raw_error.strip()
+            if not error_message:
+                error_message = (
+                    "Die Booking-API hat den Termin nicht bestätigt."
+                )
 
             await params.result_callback(
                 {
-                    "success": True,
-                    "bookingId": response_data.get("id"),
-                    "message": response_data.get("message")
-                    or "Termin wurde erfolgreich gebucht.",
-                    "request": booking_payload,
-                    "response": response_data,
-                    "timezone": self.timezone,
+                    "success": False,
+                    "error": "booking_not_confirmed",
+                    "message": error_message,
+                    "requested": booking_payload,
+                    "response": response_mapping or raw_text,
                 }
-            )
-            asyncio.create_task(
-                self._send_sms_notification(dict(booking_payload), response_mapping)
             )
             return
 
